@@ -99,14 +99,9 @@ const Login = ({ setUser }) => {
         return Object.keys(newErrors).length === 0;
     };
 
-    // Show forgot password reminder
-    const showForgotPasswordReminder = () => {
-        showAlert(
-            '🔑 Forgot your password? Please contact the TNPC office for assistance with password reset.',
-            'info',
-            5000,
-            'Password Help'
-        );
+    // Handle forgot password click -> go to OTP reset flow
+    const handleForgotPassword = () => {
+        navigate('/forgot-password');
     };
 
     // Handle form submission
@@ -180,10 +175,15 @@ const Login = ({ setUser }) => {
                 // Show error alert
                 showAlert(errorMsg, 'error', 4000);
                 
-                // Show forgot password reminder after 2 failed attempts
+                // Suggest password reset after 2 failed attempts
                 if (newAttempts >= 2) {
                     setTimeout(() => {
-                        showForgotPasswordReminder();
+                        showAlert(
+                            '🔑 Forgot your password? Click "Forgot Password?" below to reset it with an OTP sent to your email.',
+                            'info',
+                            5000,
+                            'Password Help'
+                        );
                     }, 500);
                 }
             }
@@ -203,10 +203,15 @@ const Login = ({ setUser }) => {
                 if (error.response.status === 401) {
                     showAlert('Invalid email or password. Please try again.', 'error', 4000);
                     
-                    // Show forgot password reminder after 2 failed attempts
+                    // Suggest password reset after 2 failed attempts
                     if (newAttempts >= 2) {
                         setTimeout(() => {
-                            showForgotPasswordReminder();
+                            showAlert(
+                                '🔑 Forgot your password? Click "Forgot Password?" below to reset it with an OTP sent to your email.',
+                                'info',
+                                5000,
+                                'Password Help'
+                            );
                         }, 500);
                     }
                 } else if (error.response.status === 403) {
@@ -320,9 +325,13 @@ const Login = ({ setUser }) => {
                                         <span className="font-semibold">{failedAttempts}</span> failed login attempt{failedAttempts > 1 ? 's' : ''}
                                     </p>
                                     {failedAttempts >= 2 && (
-                                        <p className="text-xs text-yellow-700 mt-1">
-                                            💡 Forgot your password? Please contact the TNPC office for assistance.
-                                        </p>
+                                        <button
+                                            type="button"
+                                            onClick={handleForgotPassword}
+                                            className="text-xs text-blue-600 hover:text-blue-700 hover:underline font-medium mt-1"
+                                        >
+                                            Reset it using OTP →
+                                        </button>
                                     )}
                                 </div>
                             </div>
@@ -403,19 +412,16 @@ const Login = ({ setUser }) => {
                             )}
                         </div>
 
-                        {/* Forgot Password Info */}
-                        <div className="flex justify-between items-center mt-1">
-                            <p className="text-xs text-gray-500">
-                                <span className="text-yellow-600">ℹ️</span> Forgot password? Contact TNPC office
-                            </p>
-                            <button
-                                type="button"
-                                onClick={showForgotPasswordReminder}
-                                className="text-xs text-blue-600 hover:text-blue-700 hover:underline transition-colors font-medium"
-                            >
-                                Need Help?
-                            </button>
-                        </div>
+                    {/* Forgot Password Link */}
+                    <div className="flex justify-end items-center mt-1">
+                        <button
+                            type="button"
+                            onClick={handleForgotPassword}
+                            className="text-sm text-blue-600 hover:text-blue-700 hover:underline transition-colors font-medium"
+                        >
+                            Forgot Password?
+                        </button>
+                    </div>
 
                         {/* Submit Button */}
                         <motion.button

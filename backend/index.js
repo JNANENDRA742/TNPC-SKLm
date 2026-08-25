@@ -1,6 +1,19 @@
+// IMPORTANT: dotenv must load FIRST so process.env is populated before the
+// mail transporters below read it (this was a bug: it used to load at line ~129).
+require("dotenv").config();
+
 const express = require("express");
 const http = require("http");
 const app = express();
+
+// Behind Render proxy in production — needed for correct client IPs in rate limiting
+app.set("trust proxy", 1);
+
+const crypto = require("crypto");
+
+// Escape user input before embedding into RegExp — prevents both regex-injection
+// and accidental mismatches (e.g. "+" in plus-addressed emails like name+tag@gmail.com)
+const escapeRegex = (str) => str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 const cors = require("cors");
 const mongoose = require("mongoose");
@@ -38,48 +51,63 @@ const io = initializeSocket(server);
 // ====================== SENDING EMAIL ===========================
 const nodemailer = require("nodemailer");
 
-// Create transporter with multiple fallback options for Render
-const transporter = nodemailer.createTransport({
-  host: "smtp.gmail.com",
-  port: 465,  // Use SSL port instead of TLS
-  secure: true, // Use SSL
-  auth: {
-    user: process.env.EMAIL,
-    pass: process.env.EMAIL_PASSWORD,
-  },
-  connectionTimeout: 30000,    // 30 seconds - increased
-  greetingTimeout: 30000,      // 30 seconds
-  socketTimeout: 30000,        // 30 seconds
+// Shared SMTP timeouts / pooling options
+const SMTP_OPTIONS = {
+  connectionTimeout: 30000,
+  greetingTimeout: 30000,
+  socketTimeout: 30000,
   pool: true,
-  maxConnections: 3,           // Reduced connections
+  maxConnections: 3,
   maxMessages: 50,
-  tls: {
-    rejectUnauthorized: false
-  }
-});
+};
 
-// Alternative transporter using port 587 with TLS (fallback)
-const createTransporterWithRetry = () => {
-  return nodemailer.createTransport({
-    host: "smtp.gmail.com",
-    port: 587,
+// ---- Provider selection ----------------------------------------------------
+// Priority: 1) Brevo SMTP (if BREVO_API_KEY set)  2) Gmail SMTP (if EMAIL_PASSWORD set)
+// sendEmail() additionally falls back to SendGrid (if SENDGRID_API_KEY set).
+let transporter = null;   // primary provider
+let gmailFallback = null; // secondary provider
+
+if (process.env.BREVO_API_KEY) {
+  transporter = nodemailer.createTransport({
+    host: process.env.BREVO_SMTP_HOST || "smtp-relay.brevo.com",
+    port: Number(process.env.BREVO_SMTP_PORT) || 587,
     secure: false,
     auth: {
-      user: process.env.EMAIL,
-      pass: process.env.EMAIL_PASSWORD,
+      // Brevo SMTP login = email used to create the Brevo account
+      user: process.env.BREVO_SMTP_LOGIN || process.env.EMAIL,
+      // Brevo SMTP key (starts with "xsmtpsib-")
+      pass: process.env.BREVO_API_KEY,
     },
-    connectionTimeout: 30000,
-    greetingTimeout: 30000,
-    socketTimeout: 30000,
-    pool: true,
-    maxConnections: 3,
-    maxMessages: 50,
-    tls: {
-      rejectUnauthorized: false,
-      ciphers: "SSLv3"
-    }
+    ...SMTP_OPTIONS,
   });
-};
+  console.log("✅ Brevo SMTP configured as PRIMARY email provider");
+}
+
+if (process.env.EMAIL && process.env.EMAIL_PASSWORD) {
+  const gmailTransporter = nodemailer.createTransport({
+    host: "smtp.gmail.com",
+    port: 465, // SSL
+    secure: true,
+    auth: {
+      user: process.env.EMAIL,
+      pass: process.env.EMAIL_PASSWORD, // 16-char Gmail App Password
+    },
+    tls: { rejectUnauthorized: false },
+    ...SMTP_OPTIONS,
+  });
+
+  if (!transporter) {
+    transporter = gmailTransporter;
+    console.log("✅ Gmail SMTP configured as PRIMARY email provider");
+  } else {
+    gmailFallback = gmailTransporter;
+    console.log("✅ Gmail SMTP configured as FALLBACK email provider");
+  }
+}
+
+if (!transporter) {
+  console.warn("⚠️  No SMTP provider configured. Set BREVO_API_KEY or EMAIL + EMAIL_PASSWORD.");
+}
 
 // SendGrid setup (optional - use as fallback)
 let sgMail = null;
@@ -126,7 +154,6 @@ app.set("io", io);
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
-require("dotenv").config();
 
 // DB Connection
 mongoose
@@ -145,8 +172,27 @@ app.get("/", (req, res) => {
   res.send("Backend Connected Successfully");
 });
 
+// ============ RATE LIMITERS (OTP abuse / brute-force protection) ==============
+const { rateLimit } = require("express-rate-limit");
+
+const otpRequestLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000, // 10 minutes
+  max: 5,                   // 5 OTP requests per IP per window
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: "Too many OTP requests. Please try again after some time." },
+});
+
+const otpActionLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: 15,                  // verify/reset attempts headroom per IP per window
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: "Too many attempts. Please try again after some time." },
+});
+
 // ================= FORGOT PASSWORD - REQUEST OTP ===============================
-app.post("/forgot-password", async (req, res) => {
+app.post("/forgot-password", otpRequestLimiter, async (req, res) => {
   const { email } = req.body;
 
   if (!email) {
@@ -158,7 +204,7 @@ app.post("/forgot-password", async (req, res) => {
 
   try {
     const existingUser = await Users.findOne({ 
-      email: { $regex: new RegExp(`^${email.trim()}$`, "i") } 
+      email: { $regex: new RegExp(`^${escapeRegex(email.trim())}$`, "i") } 
     });
     
     if (!existingUser) {
@@ -168,7 +214,17 @@ app.post("/forgot-password", async (req, res) => {
       });
     }
 
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    // Server-side resend cooldown (60s) — mirrors the frontend timer
+    const latestOtp = await otpSchema.findOne({ email: email.trim() }).sort({ createdAt: -1 });
+    if (latestOtp && Date.now() - new Date(latestOtp.createdAt).getTime() < 60 * 1000) {
+      return res.status(429).json({
+        success: false,
+        message: "OTP was sent recently. Please wait 60 seconds before requesting again."
+      });
+    }
+
+    // Cryptographically secure 6-digit OTP
+    const otp = crypto.randomInt(100000, 1000000).toString();
     const expiry = new Date(Date.now() + 5 * 60 * 1000);
 
     await otpSchema.deleteMany({ email: email.trim() });
@@ -224,7 +280,7 @@ app.post("/forgot-password", async (req, res) => {
 });
 
 // ============== VERIFY OTP ===============================
-app.post("/verify-otp", async (req, res) => {
+app.post("/verify-otp", otpActionLimiter, async (req, res) => {
   const { email, otp } = req.body;
 
   if (!email || !otp) {
@@ -235,15 +291,13 @@ app.post("/verify-otp", async (req, res) => {
   }
 
   try {
-    const otpRecord = await otpSchema.findOne({ 
-      email: email.trim(),
-      otp: otp.trim()
-    });
+    // Look up by email only, so wrong guesses can be counted per OTP
+    const otpRecord = await otpSchema.findOne({ email: email.trim() });
 
     if (!otpRecord) {
       return res.status(400).json({
         success: false,
-        message: "Invalid OTP"
+        message: "Invalid OTP or no OTP requested. Please request a new one."
       });
     }
 
@@ -255,6 +309,24 @@ app.post("/verify-otp", async (req, res) => {
       });
     }
 
+    // Brute-force protection: max 5 wrong attempts per OTP
+    if (otpRecord.otp !== otp.trim()) {
+      otpRecord.attempts = (otpRecord.attempts || 0) + 1;
+      if (otpRecord.attempts >= 5) {
+        await otpSchema.deleteOne({ _id: otpRecord._id });
+        return res.status(400).json({
+          success: false,
+          message: "Too many wrong attempts. Please request a new OTP."
+        });
+      }
+      await otpRecord.save();
+      return res.status(400).json({
+        success: false,
+        message: `Invalid OTP. ${5 - otpRecord.attempts} attempt(s) remaining.`
+      });
+    }
+
+    // Correct OTP -> single-use, delete it
     await otpSchema.deleteOne({ _id: otpRecord._id });
 
     const resetToken = jwt.sign(
@@ -279,7 +351,7 @@ app.post("/verify-otp", async (req, res) => {
 });
 
 // ============== RESET PASSWORD ===============================
-app.patch("/reset-password", async (req, res) => {
+app.patch("/reset-password", otpActionLimiter, async (req, res) => {
   const { email, password, resetToken } = req.body;
 
   if (!email || !password || !resetToken) {
@@ -315,7 +387,7 @@ app.patch("/reset-password", async (req, res) => {
     }
 
     const user = await Users.findOne({ 
-      email: { $regex: new RegExp(`^${email.trim()}$`, "i") } 
+      email: { $regex: new RegExp(`^${escapeRegex(email.trim())}$`, "i") } 
     });
 
     if (!user) {
@@ -370,7 +442,7 @@ app.post("/create-admin", async (req, res) => {
     const { name, email, password, role = "admin" } = req.body;
 
     const existingAdmin = await Users.findOne({
-      email: { $regex: new RegExp(`^${email.trim()}$`, "i") },
+      email: { $regex: new RegExp(`^${escapeRegex(email.trim())}$`, "i") },
     });
 
     if (existingAdmin) {
@@ -453,7 +525,7 @@ app.post("/login", async (req, res) => {
     }
 
     const user = await Users.findOne({
-      email: { $regex: new RegExp(`^${email.trim()}$`, "i") },
+      email: { $regex: new RegExp(`^${escapeRegex(email.trim())}$`, "i") },
     });
 
     if (!user) {
@@ -536,7 +608,7 @@ app.post("/signup", async (req, res) => {
     const trimmedEmail = email.trim();
 
     const checkValidStudent = await ActualStudentsData.findOne({
-      email: { $regex: new RegExp(`^${trimmedEmail}$`, "i") },
+      email: { $regex: new RegExp(`^${escapeRegex(trimmedEmail)}$`, "i") },
     });
 
     if (!checkValidStudent) {
@@ -547,7 +619,7 @@ app.post("/signup", async (req, res) => {
     }
 
     const existingUser = await Users.findOne({
-      email: { $regex: new RegExp(`^${trimmedEmail}$`, "i") },
+      email: { $regex: new RegExp(`^${escapeRegex(trimmedEmail)}$`, "i") },
     });
 
     if (existingUser) {
@@ -1239,7 +1311,7 @@ app.post("/admin/students", async (req, res) => {
     const trimmedYear = year ? year.toString().trim() : "4th";
 
     const existingUser = await Users.findOne({
-      email: { $regex: new RegExp(`^${trimmedEmail}$`, "i") },
+      email: { $regex: new RegExp(`^${escapeRegex(trimmedEmail)}$`, "i") },
     });
 
     if (existingUser) {
@@ -1261,7 +1333,7 @@ app.post("/admin/students", async (req, res) => {
     }
 
     let checkValidStudent = await ActualStudentsData.findOne({
-      email: { $regex: new RegExp(`^${trimmedEmail}$`, "i") },
+      email: { $regex: new RegExp(`^${escapeRegex(trimmedEmail)}$`, "i") },
     });
 
     if (!checkValidStudent) {
@@ -1482,7 +1554,7 @@ app.get("/admin/students/department/:department", async (req, res) => {
     const { department } = req.params;
 
     const students = await StudentProfile.find({
-      "profile.department": { $regex: new RegExp(`^${department}$`, "i") },
+      "profile.department": { $regex: new RegExp(`^${escapeRegex(department)}$`, "i") },
     }).populate("student");
 
     res.json({
@@ -1731,40 +1803,52 @@ app.post("/admin/drives", async (req, res) => {
 
 // Helper function to send email using multiple methods
 async function sendEmail({ to, subject, html }) {
-  // Try Gmail first
-  try {
-    console.log(`📧 Sending email to ${to} via Gmail...`);
-    const info = await transporter.sendMail({
-      from: process.env.EMAIL,
-      to: to,
-      subject: subject,
-      html: html,
-    });
-    console.log(`✅ Email sent via Gmail to ${to}`);
-    return { success: true, method: 'gmail', info };
-  } catch (gmailError) {
-    console.log(`❌ Gmail failed for ${to}:`, gmailError.message);
-    
-    // Try SendGrid as fallback if available
-    if (sgMail && process.env.SENDGRID_API_KEY) {
-      try {
-        console.log(`📧 Sending email to ${to} via SendGrid...`);
-        const msg = {
-          to: to,
-          from: process.env.EMAIL,
-          subject: subject,
-          html: html,
-        };
-        await sgMail.send(msg);
-        console.log(`✅ Email sent via SendGrid to ${to}`);
-        return { success: true, method: 'sendgrid' };
-      } catch (sendgridError) {
-        console.log(`❌ SendGrid also failed for ${to}:`, sendgridError.message);
-        throw sendgridError;
-      }
+  const failures = [];
+
+  const trySendVia = async (name, transport) => {
+    try {
+      console.log(`📧 Sending email to ${to} via ${name}...`);
+      const info = await transport.sendMail({
+        from: process.env.EMAIL,
+        to: to,
+        subject: subject,
+        html: html,
+      });
+      console.log(`✅ Email sent via ${name} to ${to}`);
+      return { success: true, method: name, info };
+    } catch (error) {
+      console.log(`❌ ${name} failed for ${to}: ${error.message}`);
+      failures.push(`${name}: ${error.message}`);
+      return null;
     }
-    throw gmailError;
+  };
+
+  // 1) Primary provider (Brevo if configured, else Gmail)
+  if (transporter) {
+    const result = await trySendVia(process.env.BREVO_API_KEY ? "brevo" : "gmail", transporter);
+    if (result) return result;
   }
+
+  // 2) Gmail fallback (when Brevo is primary)
+  if (gmailFallback) {
+    const result = await trySendVia("gmail-fallback", gmailFallback);
+    if (result) return result;
+  }
+
+  // 3) SendGrid last resort (if configured)
+  if (sgMail && process.env.SENDGRID_API_KEY) {
+    try {
+      console.log(`📧 Sending email to ${to} via SendGrid...`);
+      await sgMail.send({ to, from: process.env.EMAIL, subject, html });
+      console.log(`✅ Email sent via SendGrid to ${to}`);
+      return { success: true, method: "sendgrid" };
+    } catch (error) {
+      console.log(`❌ SendGrid also failed for ${to}: ${error.message}`);
+      failures.push(`sendgrid: ${error.message}`);
+    }
+  }
+
+  throw new Error(`All email providers failed -> ${failures.join(" | ")}`);
 }
 
 // Function to send email with retry
