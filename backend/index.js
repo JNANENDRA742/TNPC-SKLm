@@ -2,6 +2,23 @@
 // mail transporters below read it (this was a bug: it used to load at line ~129).
 require("dotenv").config();
 
+const dns = require("dns");
+const https = require("https");
+
+// Force IPv4 result order globally across Node.js networking
+// This prevents Brevo API / SMTP from failing due to IPv6 connection timeouts on IPv4-only networks
+if (dns.setDefaultResultOrder) {
+  dns.setDefaultResultOrder("ipv4first");
+}
+
+// Custom DNS lookup function enforcing IPv4 (AF_INET)
+const ipv4DnsLookup = (hostname, options, callback) => {
+  return dns.lookup(hostname, { ...options, family: 4 }, callback);
+};
+
+// Dedicated IPv4 HTTP/HTTPS agent for Brevo REST API calls
+const brevoIpv4Agent = new https.Agent({ family: 4, keepAlive: true });
+
 const express = require("express");
 const http = require("http");
 const app = express();
@@ -51,7 +68,7 @@ const io = initializeSocket(server);
 // ====================== SENDING EMAIL ===========================
 const nodemailer = require("nodemailer");
 
-// Shared SMTP timeouts / pooling options
+// Shared SMTP timeouts / pooling options with IPv4 family enforcement
 const SMTP_OPTIONS = {
   connectionTimeout: 30000,
   greetingTimeout: 30000,
@@ -59,10 +76,76 @@ const SMTP_OPTIONS = {
   pool: true,
   maxConnections: 3,
   maxMessages: 50,
+  family: 4,
+  lookup: ipv4DnsLookup,
 };
 
+// Brevo REST API v3 sender function (forces IPv4 over HTTPS port 443)
+async function sendBrevoApiEmail({ to, subject, html }) {
+  const apiKey = process.env.BREVO_API_KEY;
+  const senderEmail = process.env.EMAIL || process.env.BREVO_SMTP_LOGIN;
+  const senderName = process.env.EMAIL_SENDER_NAME || "TNPC Portal";
+
+  if (!apiKey) {
+    throw new Error("BREVO_API_KEY is not configured");
+  }
+  if (!senderEmail) {
+    throw new Error("Sender email (EMAIL or BREVO_SMTP_LOGIN) is not configured");
+  }
+
+  const postData = JSON.stringify({
+    sender: { name: senderName, email: senderEmail },
+    to: [{ email: to }],
+    subject: subject,
+    htmlContent: html,
+  });
+
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      {
+        hostname: "api.brevo.com",
+        port: 443,
+        path: "/v3/smtp/email",
+        method: "POST",
+        agent: brevoIpv4Agent,
+        headers: {
+          accept: "application/json",
+          "api-key": apiKey,
+          "content-type": "application/json",
+          "content-length": Buffer.byteLength(postData),
+        },
+      },
+      (res) => {
+        let body = "";
+        res.on("data", (chunk) => {
+          body += chunk;
+        });
+        res.on("end", () => {
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            try {
+              const parsed = JSON.parse(body);
+              resolve({ success: true, messageId: parsed.messageId });
+            } catch (e) {
+              resolve({ success: true, body });
+            }
+          } else {
+            reject(new Error(`Brevo REST API error (${res.statusCode}): ${body}`));
+          }
+        });
+      }
+    );
+
+    req.on("error", (err) => {
+      reject(new Error(`Brevo REST API IPv4 request failed: ${err.message}`));
+    });
+
+    req.write(postData);
+    req.end();
+  });
+}
+
 // ---- Provider selection ----------------------------------------------------
-// Priority: 1) Brevo SMTP (if BREVO_API_KEY set)  2) Gmail SMTP (if EMAIL_PASSWORD set)
+// Priority: 1) Brevo (API / SMTP)  2) Gmail SMTP (if EMAIL_PASSWORD set)
 // sendEmail() additionally falls back to SendGrid (if SENDGRID_API_KEY set).
 let transporter = null;   // primary provider
 let gmailFallback = null; // secondary provider
@@ -72,15 +155,17 @@ if (process.env.BREVO_API_KEY) {
     host: process.env.BREVO_SMTP_HOST || "smtp-relay.brevo.com",
     port: Number(process.env.BREVO_SMTP_PORT) || 587,
     secure: false,
+    family: 4,
+    lookup: ipv4DnsLookup,
     auth: {
       // Brevo SMTP login = email used to create the Brevo account
       user: process.env.BREVO_SMTP_LOGIN || process.env.EMAIL,
-      // Brevo SMTP key (starts with "xsmtpsib-")
+      // Brevo SMTP key (starts with "xsmtpsib-") or API key
       pass: process.env.BREVO_API_KEY,
     },
     ...SMTP_OPTIONS,
   });
-  console.log("✅ Brevo SMTP configured as PRIMARY email provider");
+  console.log("✅ Brevo (REST API & SMTP) configured as PRIMARY email provider (IPv4 forced)");
 }
 
 if (process.env.EMAIL && process.env.EMAIL_PASSWORD) {
@@ -88,6 +173,8 @@ if (process.env.EMAIL && process.env.EMAIL_PASSWORD) {
     host: "smtp.gmail.com",
     port: 465, // SSL
     secure: true,
+    family: 4,
+    lookup: ipv4DnsLookup,
     auth: {
       user: process.env.EMAIL,
       pass: process.env.EMAIL_PASSWORD, // 16-char Gmail App Password
@@ -98,15 +185,15 @@ if (process.env.EMAIL && process.env.EMAIL_PASSWORD) {
 
   if (!transporter) {
     transporter = gmailTransporter;
-    console.log("✅ Gmail SMTP configured as PRIMARY email provider");
+    console.log("✅ Gmail SMTP configured as PRIMARY email provider (IPv4 forced)");
   } else {
     gmailFallback = gmailTransporter;
-    console.log("✅ Gmail SMTP configured as FALLBACK email provider");
+    console.log("✅ Gmail SMTP configured as FALLBACK email provider (IPv4 forced)");
   }
 }
 
-if (!transporter) {
-  console.warn("⚠️  No SMTP provider configured. Set BREVO_API_KEY or EMAIL + EMAIL_PASSWORD.");
+if (!transporter && !process.env.BREVO_API_KEY) {
+  console.warn("⚠️  No email provider configured. Set BREVO_API_KEY or EMAIL + EMAIL_PASSWORD.");
 }
 
 // SendGrid setup (optional - use as fallback)
@@ -125,6 +212,7 @@ try {
 let transporterVerified = false;
 
 function verifyTransporter(retryCount = 0) {
+  if (!transporter) return;
   transporter.verify((error, success) => {
     if (error) {
       console.error(`❌ SMTP verification failed (attempt ${retryCount + 1}):`, error.message);
@@ -132,7 +220,7 @@ function verifyTransporter(retryCount = 0) {
         console.log(`🔄 Retrying SMTP verification in 5 seconds...`);
         setTimeout(() => verifyTransporter(retryCount + 1), 5000);
       } else {
-        console.error("❌ SMTP verification failed after 3 attempts. Emails may not work.");
+        console.error("❌ SMTP verification failed after 3 attempts. Emails may fall back to REST API.");
       }
     } else {
       console.log("✅ SMTP server is ready to accept messages");
@@ -1801,19 +1889,14 @@ app.post("/admin/drives", async (req, res) => {
 
 // ================= EMAIL SENDING FUNCTION WITH RETRY AND SENDGRID FALLBACK ================================
 
-// Helper function to send email using multiple methods
+// Helper function to send email using multiple methods with IPv4 enforcement
 async function sendEmail({ to, subject, html }) {
   const failures = [];
 
-  const trySendVia = async (name, transport) => {
+  const trySendVia = async (name, fn) => {
     try {
       console.log(`📧 Sending email to ${to} via ${name}...`);
-      const info = await transport.sendMail({
-        from: process.env.EMAIL,
-        to: to,
-        subject: subject,
-        html: html,
-      });
+      const info = await fn();
       console.log(`✅ Email sent via ${name} to ${to}`);
       return { success: true, method: name, info };
     } catch (error) {
@@ -1823,29 +1906,48 @@ async function sendEmail({ to, subject, html }) {
     }
   };
 
-  // 1) Primary provider (Brevo if configured, else Gmail)
+  // 1) Brevo REST API over IPv4 (if BREVO_API_KEY configured)
+  if (process.env.BREVO_API_KEY) {
+    const apiResult = await trySendVia("brevo-api-ipv4", () =>
+      sendBrevoApiEmail({ to, subject, html })
+    );
+    if (apiResult) return apiResult;
+  }
+
+  // 2) Primary SMTP provider (Brevo SMTP or Gmail SMTP with IPv4 family forced)
   if (transporter) {
-    const result = await trySendVia(process.env.BREVO_API_KEY ? "brevo" : "gmail", transporter);
-    if (result) return result;
+    const smtpResult = await trySendVia(
+      process.env.BREVO_API_KEY ? "brevo-smtp-ipv4" : "gmail-smtp-ipv4",
+      () =>
+        transporter.sendMail({
+          from: process.env.EMAIL,
+          to: to,
+          subject: subject,
+          html: html,
+        })
+    );
+    if (smtpResult) return smtpResult;
   }
 
-  // 2) Gmail fallback (when Brevo is primary)
+  // 3) Gmail fallback (when Brevo was primary)
   if (gmailFallback) {
-    const result = await trySendVia("gmail-fallback", gmailFallback);
-    if (result) return result;
+    const fallbackResult = await trySendVia("gmail-fallback-ipv4", () =>
+      gmailFallback.sendMail({
+        from: process.env.EMAIL,
+        to: to,
+        subject: subject,
+        html: html,
+      })
+    );
+    if (fallbackResult) return fallbackResult;
   }
 
-  // 3) SendGrid last resort (if configured)
+  // 4) SendGrid last resort (if configured)
   if (sgMail && process.env.SENDGRID_API_KEY) {
-    try {
-      console.log(`📧 Sending email to ${to} via SendGrid...`);
-      await sgMail.send({ to, from: process.env.EMAIL, subject, html });
-      console.log(`✅ Email sent via SendGrid to ${to}`);
-      return { success: true, method: "sendgrid" };
-    } catch (error) {
-      console.log(`❌ SendGrid also failed for ${to}: ${error.message}`);
-      failures.push(`sendgrid: ${error.message}`);
-    }
+    const sgResult = await trySendVia("sendgrid-ipv4", () =>
+      sgMail.send({ to, from: process.env.EMAIL, subject, html })
+    );
+    if (sgResult) return sgResult;
   }
 
   throw new Error(`All email providers failed -> ${failures.join(" | ")}`);

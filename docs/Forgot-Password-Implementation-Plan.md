@@ -78,12 +78,10 @@ You already have code for two providers. You just need **credentials**:
 - ⚠️ Downsides: shared IP reputation, daily caps, can break on cloud hosts occasionally
   (your code already has `connectionTimeout` + retry + SendGrid fallback for this reason).
 
-#### Option B — Brevo (ex-Sendinblue) — *you tried this, then removed it in commit `0fd6314`*
-- **300 emails/day free**, no credit card, SMTP or HTTP API. Good production choice for
-  a placement portal's volume (OTP + drive notifications).
-- Setup: brevo.com → SMTP & API tab → copy **SMTP key** → use as `EMAIL_PASSWORD` with
-  `host: smtp-relay.brevo.com, port: 587`. (You'd change the two transporter blocks in
-  `index.js`, or better — read host/port from env, see §5.)
+#### Option B — Brevo (ex-Sendinblue) — *Enhanced with IPv4 support*
+- **300 emails/day free**, no credit card required.
+- **IPv4 Enhanced:** Full dual-tier integration supporting both Brevo HTTP REST API v3 (port 443 over HTTPS) and Brevo SMTP (`smtp-relay.brevo.com`), with `family: 4` IPv4 enforcement and `dns.setDefaultResultOrder("ipv4first")` to resolve network timeout issues.
+- Setup: brevo.com → SMTP & API tab → copy API / SMTP key → set `BREVO_API_KEY` in `backend/.env`.
 
 #### Option C — SendGrid (already coded as automatic fallback)
 - 100 emails/day free. Set `SENDGRID_API_KEY` and the existing `sendEmail()` function
