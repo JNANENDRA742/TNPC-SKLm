@@ -80,11 +80,19 @@ const SMTP_OPTIONS = {
   lookup: ipv4DnsLookup,
 };
 
+// Helper to get verified Brevo sender - prioritizes BREVO_SENDER_EMAIL (must be validated in Brevo dashboard)
+function getSenderEmail() {
+  return process.env.BREVO_SENDER_EMAIL || process.env.BREVO_SMTP_LOGIN || process.env.EMAIL;
+}
+function getSenderName() {
+  return process.env.EMAIL_SENDER_NAME || "TNPC Portal";
+}
+
 // Brevo REST API v3 sender function (forces IPv4 over HTTPS port 443)
 async function sendBrevoApiEmail({ to, subject, html }) {
   const apiKey = process.env.BREVO_API_KEY;
-  const senderEmail = process.env.EMAIL || process.env.BREVO_SMTP_LOGIN;
-  const senderName = process.env.EMAIL_SENDER_NAME || "TNPC Portal";
+  const senderEmail = getSenderEmail();
+  const senderName = getSenderName();
 
   if (!apiKey) {
     throw new Error("BREVO_API_KEY is not configured");
@@ -757,6 +765,43 @@ app.post("/signup", async (req, res) => {
     });
 
     const token = generateToken(newUser);
+
+    // Send welcome email (non-blocking)
+    sendEmail({
+      to: trimmedEmail,
+      subject: "Welcome to TNPC Portal 🎉 - Registration Successful",
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background: #f9f9f9; border-radius: 10px;">
+          <div style="background: linear-gradient(135deg, #1a56db, #7c3aed); padding: 30px; border-radius: 10px 10px 0 0; text-align: center;">
+            <h1 style="color: white; margin: 0; font-size: 24px;">🎉 Welcome to TNPC Portal</h1>
+            <p style="color: white; margin: 10px 0 0 0; font-size: 14px;">Training & Placement Cell, RGUKT-SKLM</p>
+          </div>
+          <div style="background: white; padding: 30px; border-radius: 0 0 10px 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
+            <p style="color: #4a5568; font-size: 16px;">Hello <strong>${checkValidStudent.name.trim()}</strong>,</p>
+            <p style="color: #4a5568; font-size: 16px;">Your account has been <strong style="color: #10b981;">successfully created</strong> on the TNPC Portal.</p>
+            <div style="background: #f7fafc; padding: 15px; border-radius: 8px; margin: 20px 0;">
+              <p style="margin: 8px 0;"><strong>🆔 Student ID:</strong> ${checkValidStudent.id_no.trim()}</p>
+              <p style="margin: 8px 0;"><strong>📧 Email:</strong> ${trimmedEmail}</p>
+              <p style="margin: 8px 0;"><strong>🏫 Department:</strong> ${checkValidStudent.department.trim() || "N/A"}</p>
+              <p style="margin: 8px 0;"><strong>📅 Year:</strong> ${checkValidStudent.year.trim() || "N/A"}</p>
+            </div>
+            <div style="background: #ebf8ff; border-left: 4px solid #1a56db; padding: 15px; margin: 20px 0;">
+              <p style="margin: 0; color: #2b6cb0; font-size: 14px;"><strong>📌 Next Steps:</strong><br/>
+              1. Login to the portal<br/>
+              2. Complete your profile (CGPA, skills, resume, etc.)<br/>
+              3. Explore placement drives and apply<br/>
+              4. Keep your profile updated for better opportunities
+              </p>
+            </div>
+            <div style="text-align: center; margin: 25px 0;">
+              <a href="${process.env.FRONTEND_URL || "http://localhost:5173"}" style="background: #1a56db; color: white; padding: 12px 30px; text-decoration: none; border-radius: 5px; display: inline-block;">🚀 Login to Portal</a>
+            </div>
+            <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 20px 0;" />
+            <p style="color: #718096; font-size: 12px; text-align: center;">This is an automated email from TNPC Portal. If you did not register, please contact support.</p>
+          </div>
+        </div>
+      `,
+    }).then(() => console.log(`✅ Welcome email sent to ${trimmedEmail}`)).catch((err) => console.error(`❌ Failed to send welcome email to ${trimmedEmail}:`, err.message));
 
     res.status(201).json({
       success: true,
@@ -1487,6 +1532,35 @@ app.post("/admin/students", async (req, res) => {
       shortlisted_drives: [],
     });
 
+    // Send welcome email via admin creation (non-blocking)
+    sendEmail({
+      to: trimmedEmail,
+      subject: "Welcome to TNPC Portal 🎉 - Account Created by Admin",
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background: #f9f9f9; border-radius: 10px;">
+          <div style="background: linear-gradient(135deg, #1a56db, #7c3aed); padding: 30px; border-radius: 10px 10px 0 0; text-align: center;">
+            <h1 style="color: white; margin: 0; font-size: 24px;">🎉 Welcome to TNPC Portal</h1>
+            <p style="color: white; margin: 10px 0 0 0; font-size: 14px;">Training & Placement Cell, RGUKT-SKLM</p>
+          </div>
+          <div style="background: white; padding: 30px; border-radius: 0 0 10px 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
+            <p style="color: #4a5568; font-size: 16px;">Hello <strong>${name.trim()}</strong>,</p>
+            <p style="color: #4a5568; font-size: 16px;">Your account has been <strong style="color: #10b981;">created by the admin</strong> on the TNPC Portal. You can now login using your credentials.</p>
+            <div style="background: #f7fafc; padding: 15px; border-radius: 8px; margin: 20px 0;">
+              <p style="margin: 8px 0;"><strong>🆔 Student ID:</strong> ${studentId.trim()}</p>
+              <p style="margin: 8px 0;"><strong>📧 Email:</strong> ${trimmedEmail}</p>
+              <p style="margin: 8px 0;"><strong>🏫 Department:</strong> ${department || checkValidStudent?.department || "Not Specified"}</p>
+              <p style="margin: 8px 0;"><strong>📅 Year:</strong> ${trimmedYear}</p>
+            </div>
+            <div style="text-align: center; margin: 25px 0;">
+              <a href="${process.env.FRONTEND_URL || "http://localhost:5173"}" style="background: #1a56db; color: white; padding: 12px 30px; text-decoration: none; border-radius: 5px; display: inline-block;">🚀 Login to Portal</a>
+            </div>
+            <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 20px 0;" />
+            <p style="color: #718096; font-size: 12px; text-align: center;">This is an automated email from TNPC Portal. Contact admin if you did not expect this.</p>
+          </div>
+        </div>
+      `,
+    }).then(() => console.log(`✅ Admin welcome email sent to ${trimmedEmail}`)).catch((err) => console.error(`❌ Failed to send admin welcome email to ${trimmedEmail}:`, err.message));
+
     res.status(201).json({
       success: true,
       message: "Student added successfully",
@@ -1565,8 +1639,41 @@ app.delete("/admin/students/:id", async (req, res) => {
       return res.status(404).json({ message: "Student not found" });
     }
 
+    const studentEmail = student.email;
+    const studentName = student.name;
+
     await Users.findByIdAndDelete(id);
     await StudentProfile.findOneAndDelete({ student: id });
+
+    // Send deletion notification email (non-blocking)
+    if (studentEmail) {
+      sendEmail({
+        to: studentEmail,
+        subject: "TNPC Portal - Account Deleted",
+        html: `
+          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background: #f9f9f9; border-radius: 10px;">
+            <div style="background: linear-gradient(135deg, #dc2626, #991b1b); padding: 30px; border-radius: 10px 10px 0 0; text-align: center;">
+              <h1 style="color: white; margin: 0; font-size: 24px;">⚠️ Account Deleted</h1>
+            </div>
+            <div style="background: white; padding: 30px; border-radius: 0 0 10px 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
+              <p style="color: #4a5568; font-size: 16px;">Hello <strong>${studentName}</strong>,</p>
+              <p style="color: #4a5568; font-size: 16px;">Your account associated with <strong>${studentEmail}</strong> has been <strong style="color: #dc2626;">deleted by the admin</strong> from the TNPC Portal.</p>
+              <div style="background: #fef2f2; border-left: 4px solid #dc2626; padding: 15px; margin: 20px 0;">
+                <p style="margin: 0; color: #991b1b; font-size: 14px;">
+                  <strong>What this means:</strong><br/>
+                  • You will no longer be able to login to the TNPC Portal<br/>
+                  • Your profile and application data have been removed<br/>
+                  • You will not receive further placement drive notifications
+                </p>
+              </div>
+              <p style="color: #4a5568; font-size: 14px;">If you believe this was done in error, please contact the Training & Placement Cell immediately.</p>
+              <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 20px 0;" />
+              <p style="color: #718096; font-size: 12px; text-align: center;">This is an automated email from TNPC Portal, RGUKT-SKLM. Please do not reply.</p>
+            </div>
+          </div>
+        `,
+      }).then(() => console.log(`✅ Deletion email sent to ${studentEmail}`)).catch((err) => console.error(`❌ Failed to send deletion email to ${studentEmail}:`, err.message));
+    }
 
     res.status(200).json({ message: "Student deleted successfully" });
   } catch (error) {
@@ -1920,7 +2027,7 @@ async function sendEmail({ to, subject, html }) {
       process.env.BREVO_API_KEY ? "brevo-smtp-ipv4" : "gmail-smtp-ipv4",
       () =>
         transporter.sendMail({
-          from: process.env.EMAIL,
+          from: `${getSenderName()} <${getSenderEmail()}>`,
           to: to,
           subject: subject,
           html: html,
@@ -1933,7 +2040,7 @@ async function sendEmail({ to, subject, html }) {
   if (gmailFallback) {
     const fallbackResult = await trySendVia("gmail-fallback-ipv4", () =>
       gmailFallback.sendMail({
-        from: process.env.EMAIL,
+        from: `${getSenderName()} <${getSenderEmail()}>`,
         to: to,
         subject: subject,
         html: html,
@@ -1945,7 +2052,7 @@ async function sendEmail({ to, subject, html }) {
   // 4) SendGrid last resort (if configured)
   if (sgMail && process.env.SENDGRID_API_KEY) {
     const sgResult = await trySendVia("sendgrid-ipv4", () =>
-      sgMail.send({ to, from: process.env.EMAIL, subject, html })
+      sgMail.send({ to, from: getSenderEmail(), subject, html })
     );
     if (sgResult) return sgResult;
   }
@@ -1995,7 +2102,7 @@ async function sendDriveNotificationEmails(driveData) {
     }
 
     console.log(`📧 Found ${students.length} students to send notifications`);
-    console.log(`📧 Using email: ${process.env.EMAIL}`);
+    console.log(`📧 Using sender: ${getSenderEmail()} (${getSenderName()})`);
     console.log(`📧 Email password set: ${!!process.env.EMAIL_PASSWORD}`);
     if (sgMail && process.env.SENDGRID_API_KEY) {
       console.log(`📧 SendGrid fallback: ✅ Available`);
@@ -2150,7 +2257,6 @@ app.post("/admin/test-email", async (req, res) => {
         <p>This is a test email from the TNPC Portal.</p>
         <p>If you're receiving this, the email configuration is working correctly!</p>
         <p>Timestamp: ${new Date().toISOString()}</p>
-        <p>Method: ${result.method || 'unknown'}</p>
       `,
     });
 
